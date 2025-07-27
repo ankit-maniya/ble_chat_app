@@ -46,10 +46,15 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
   List<ScanResult> _scanResults = [];
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<List<int>>? _characteristicSubscription;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
 
   // Add this to track the last sent message to avoid duplicates
   String? _lastSentMessage;
   DateTime? _lastSentTime;
+
+  // Add connection status tracking
+  bool _isConnecting = false;
+  String? _connectionError;
 
   @override
   void initState() {
@@ -62,6 +67,7 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
   void dispose() {
     _connectionSubscription?.cancel();
     _characteristicSubscription?.cancel();
+    _scanSubscription?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     _stopAdvertising();
@@ -93,6 +99,18 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
           setState(() => _isConnected = false);
           _showSnackBar('Device disconnected!');
           break;
+        case 'onAdvertisingStarted':
+          setState(() => _isAdvertising = true);
+          break;
+        case 'onAdvertisingFailed':
+          setState(() {
+            _isAdvertising = false;
+            _isPeripheralMode = false;
+          });
+          _showSnackBar(
+            'Advertising failed: ${call.arguments?['error'] ?? 'Unknown error'}',
+          );
+          break;
       }
     });
   }
@@ -101,7 +119,7 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
     try {
       setState(() {
         _isPeripheralMode = true;
-        _isAdvertising = true;
+        _isAdvertising = false; // Will be set to true in callback
       });
 
       await _channel.invokeMethod('startPeripheral', {
@@ -154,51 +172,78 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
     setState(() {
       _isScanning = true;
       _scanResults.clear();
+      _connectionError = null;
     });
 
     try {
+      // Cancel any existing scan subscription
+      await _scanSubscription?.cancel();
+
       await FlutterBluePlus.startScan(
         timeout: Duration(seconds: 15),
         withServices: [Guid(SERVICE_UUID)],
       );
 
-      FlutterBluePlus.scanResults.listen((results) {
-        setState(() {
-          _scanResults = results
-              .where(
-                (r) =>
-                    r.device.advName.isNotEmpty ||
-                    r.advertisementData.advName.isNotEmpty,
-              )
-              .toList();
-        });
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+        if (mounted) {
+          setState(() {
+            _scanResults = results
+                .where(
+                  (r) =>
+                      r.device.advName.isNotEmpty ||
+                      r.advertisementData.advName.isNotEmpty,
+                )
+                .toList();
+          });
+        }
       });
 
       await Future.delayed(Duration(seconds: 15));
       await FlutterBluePlus.stopScan();
     } catch (e) {
       _showSnackBar('Scanning failed: $e');
+      setState(() => _connectionError = 'Scanning failed: $e');
     }
 
-    setState(() => _isScanning = false);
+    if (mounted) {
+      setState(() => _isScanning = false);
+    }
   }
 
   Future<void> _connectToDevice(BluetoothDevice device) async {
+    if (_isConnecting) return;
+
+    setState(() {
+      _isConnecting = true;
+      _connectionError = null;
+    });
+
     try {
+      // Cancel any existing connections
+      await _connectionSubscription?.cancel();
+      await _characteristicSubscription?.cancel();
+
       await device.connect(timeout: Duration(seconds: 10));
-      setState(() {
-        _connectedDevice = device;
-        _isConnected = true;
-      });
+
+      if (mounted) {
+        setState(() {
+          _connectedDevice = device;
+          _isConnected = true;
+          _isConnecting = false;
+        });
+      }
 
       _connectionSubscription = device.connectionState.listen((state) {
-        if (state == BluetoothConnectionState.disconnected) {
-          setState(() {
-            _isConnected = false;
-            _connectedDevice = null;
-            _chatCharacteristic = null;
-          });
-          _showSnackBar('Disconnected from device');
+        if (mounted) {
+          if (state == BluetoothConnectionState.disconnected) {
+            setState(() {
+              _isConnected = false;
+              _connectedDevice = null;
+              _chatCharacteristic = null;
+              _isConnecting = false;
+            });
+            _showSnackBar('Disconnected from device');
+          }
         }
       });
 
@@ -207,6 +252,12 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
         'Connected to ${device.advName.isEmpty ? "Device" : device.advName}',
       );
     } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isConnecting = false;
+          _connectionError = 'Connection failed: $e';
+        });
+      }
       _showSnackBar('Connection failed: $e');
     }
   }
@@ -229,30 +280,33 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
 
               if (characteristic.properties.notify) {
                 await characteristic.setNotifyValue(true);
-                _characteristicSubscription = characteristic.lastValueStream.listen((
-                  value,
-                ) {
-                  if (value.isNotEmpty) {
-                    try {
-                      String message = utf8.decode(value);
 
-                      // Check if this is our own message echoed back
-                      // Skip if it matches the last sent message within 1 second
-                      if (_lastSentMessage != null &&
-                          _lastSentTime != null &&
-                          message == _lastSentMessage &&
-                          DateTime.now().difference(_lastSentTime!).inSeconds <
-                              1) {
-                        // This is likely our own message echoed back, ignore it
-                        return;
+                // Cancel any existing subscription
+                await _characteristicSubscription?.cancel();
+
+                _characteristicSubscription = characteristic.lastValueStream
+                    .listen((value) {
+                      if (value.isNotEmpty && mounted) {
+                        try {
+                          String message = utf8.decode(value);
+
+                          // Check if this is our own message echoed back
+                          if (_lastSentMessage != null &&
+                              _lastSentTime != null &&
+                              message == _lastSentMessage &&
+                              DateTime.now()
+                                      .difference(_lastSentTime!)
+                                      .inSeconds <
+                                  1) {
+                            return; // Ignore echo
+                          }
+
+                          _addMessage(message, false);
+                        } catch (e) {
+                          debugPrint('Error decoding message: $e');
+                        }
                       }
-
-                      _addMessage(message, false);
-                    } catch (e) {
-                      debugPrint('Error decoding message: $e');
-                    }
-                  }
-                });
+                    });
               }
               break;
             }
@@ -299,27 +353,31 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
   }
 
   void _addMessage(String message, bool isSent) {
-    setState(() {
-      _messages.add(
-        ChatMessage(text: message, isSent: isSent, timestamp: DateTime.now()),
-      );
-    });
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: Duration(milliseconds: 300),
-          curve: Curves.easeOut,
+    if (mounted) {
+      setState(() {
+        _messages.add(
+          ChatMessage(text: message, isSent: isSent, timestamp: DateTime.now()),
         );
-      }
-    });
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_scrollController.hasClients) {
+          _scrollController.animateTo(
+            _scrollController.position.maxScrollExtent,
+            duration: Duration(milliseconds: 300),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+    }
   }
 
   void _showSnackBar(String message) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: Duration(seconds: 3)),
+      );
+    }
   }
 
   Future<void> _disconnect() async {
@@ -329,11 +387,20 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
       await _connectedDevice!.disconnect();
     }
 
-    setState(() {
-      _messages.clear();
-      _lastSentMessage = null;
-      _lastSentTime = null;
-    });
+    if (mounted) {
+      setState(() {
+        _messages.clear();
+        _lastSentMessage = null;
+        _lastSentTime = null;
+        _connectionError = null;
+        _isConnecting = false;
+      });
+    }
+  }
+
+  Future<void> _refreshScan() async {
+    await FlutterBluePlus.stopScan();
+    await _startScanning();
   }
 
   @override
@@ -374,6 +441,9 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
       statusColor = Colors.green;
       statusText =
           'Client: Connected to ${_connectedDevice?.advName ?? "Device"}';
+    } else if (_isConnecting) {
+      statusColor = Colors.orange;
+      statusText = 'Connecting...';
     } else {
       statusColor = Colors.red;
       statusText = 'Not Connected';
@@ -390,10 +460,21 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
             size: 20,
           ),
           SizedBox(width: 8),
-          Text(
-            statusText,
-            style: TextStyle(color: statusColor, fontWeight: FontWeight.bold),
+          Expanded(
+            child: Text(
+              statusText,
+              style: TextStyle(color: statusColor, fontWeight: FontWeight.bold),
+            ),
           ),
+          if (_isConnecting)
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(statusColor),
+              ),
+            ),
         ],
       ),
     );
@@ -418,7 +499,9 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
           ),
           SizedBox(height: 32),
           ElevatedButton.icon(
-            onPressed: _isAdvertising ? null : _startPeripheralMode,
+            onPressed: (_isAdvertising || _isScanning)
+                ? null
+                : _startPeripheralMode,
             icon: Icon(Icons.router),
             label: Text(
               _isAdvertising ? 'Starting Server...' : 'Start as Server',
@@ -433,7 +516,9 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
           Text('OR', style: TextStyle(fontWeight: FontWeight.bold)),
           SizedBox(height: 16),
           ElevatedButton.icon(
-            onPressed: _isScanning ? null : _startCentralMode,
+            onPressed: (_isScanning || _isAdvertising)
+                ? null
+                : _startCentralMode,
             icon: Icon(_isScanning ? Icons.hourglass_empty : Icons.search),
             label: Text(_isScanning ? 'Scanning...' : 'Join as Client'),
             style: ElevatedButton.styleFrom(
@@ -442,11 +527,44 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
               minimumSize: Size(double.infinity, 50),
             ),
           ),
+          if (_connectionError != null) ...[
+            SizedBox(height: 16),
+            Container(
+              padding: EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.red.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.withOpacity(0.3)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.error_outline, color: Colors.red, size: 20),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _connectionError!,
+                      style: TextStyle(color: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           if (_scanResults.isNotEmpty) ...[
             SizedBox(height: 32),
-            Text(
-              'Available Servers:',
-              style: Theme.of(context).textTheme.titleMedium,
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'Available Servers:',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                IconButton(
+                  onPressed: _isScanning ? null : _refreshScan,
+                  icon: Icon(Icons.refresh),
+                  tooltip: 'Refresh scan',
+                ),
+              ],
             ),
             SizedBox(height: 16),
             Expanded(
@@ -464,12 +582,42 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
                     child: ListTile(
                       leading: Icon(Icons.router, color: Colors.green),
                       title: Text(deviceName),
-                      subtitle: Text('Signal: ${result.rssi} dBm'),
-                      trailing: Icon(Icons.arrow_forward_ios),
-                      onTap: () => _connectToDevice(result.device),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Signal: ${result.rssi} dBm'),
+                          Text(
+                            'Address: ${result.device.remoteId}',
+                            style: TextStyle(fontSize: 12, color: Colors.grey),
+                          ),
+                        ],
+                      ),
+                      trailing: _isConnecting
+                          ? SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(Icons.arrow_forward_ios),
+                      onTap: _isConnecting
+                          ? null
+                          : () => _connectToDevice(result.device),
                     ),
                   );
                 },
+              ),
+            ),
+          ] else if (!_isScanning && !_isPeripheralMode) ...[
+            SizedBox(height: 32),
+            Text('No servers found', style: TextStyle(color: Colors.grey[600])),
+            SizedBox(height: 8),
+            ElevatedButton.icon(
+              onPressed: _refreshScan,
+              icon: Icon(Icons.refresh),
+              label: Text('Scan Again'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.grey[600],
+                foregroundColor: Colors.white,
               ),
             ),
           ],
@@ -556,8 +704,19 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
   }
 
   Widget _buildMessageInput() {
-    return Padding(
+    return Container(
       padding: EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.2),
+            spreadRadius: 1,
+            blurRadius: 3,
+            offset: Offset(0, -1),
+          ),
+        ],
+      ),
       child: Row(
         children: [
           Expanded(
@@ -571,8 +730,13 @@ class _BLEChatScreenState extends State<BLEChatScreen> {
                 ),
                 filled: true,
                 fillColor: Colors.grey[100],
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 10,
+                ),
               ),
               onSubmitted: _sendMessage,
+              textInputAction: TextInputAction.send,
             ),
           ),
           SizedBox(width: 12),

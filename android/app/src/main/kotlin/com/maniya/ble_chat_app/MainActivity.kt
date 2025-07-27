@@ -15,7 +15,14 @@ class MainActivity : FlutterActivity() {
     private var bluetoothGattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var characteristic: BluetoothGattCharacteristic? = null
-    private var connectedDevices: MutableSet<BluetoothDevice> = mutableSetOf()
+    
+    // Use concurrent collections to avoid issues with concurrent modifications
+    private var connectedDevices: MutableSet<BluetoothDevice> = Collections.synchronizedSet(mutableSetOf())
+    private val notificationEnabledDevices: MutableSet<BluetoothDevice> = Collections.synchronizedSet(mutableSetOf())
+    
+    // Track devices by MAC address to prevent duplicates based on device instances
+    private val deviceAddresses: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    private val notificationAddresses: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     // Custom UUIDs for your chat service
     private val SERVICE_UUID: UUID = UUID.fromString("12345678-1234-1234-1234-123456789abc")
@@ -55,12 +62,29 @@ class MainActivity : FlutterActivity() {
     private fun setCharacteristicValue(message: String) {
         val value = message.toByteArray(Charsets.UTF_8)
 
-        notificationEnabledDevices.forEach { device ->
+        // Group devices by address to avoid sending to same device multiple times
+        val uniqueDevices = notificationEnabledDevices.groupBy { it.address }.mapValues { it.value.first() }
+        
+        uniqueDevices.values.forEach { device ->
             characteristic?.let { char ->
-                // Send directly without setting char.value
-                val success =
-                        bluetoothGattServer?.notifyCharacteristicChanged(device, char, false, value)
-                Log.i("BLE", "Message sent to ${device.address}: $success")
+                try {
+                    // Check if device is still connected before sending
+                    if (deviceAddresses.contains(device.address)) {
+                        val success = bluetoothGattServer?.notifyCharacteristicChanged(device, char, false, value)
+                        Log.i("BLE", "Message sent to ${device.address}: $success")
+                        
+                        if (success != BluetoothGatt.GATT_SUCCESS) {
+                            Log.w("BLE", "Notification failed for ${device.address} - removing from lists")
+                            cleanupDevice(device)
+                        }
+                    } else {
+                        Log.w("BLE", "Device ${device.address} no longer connected - removing from notification list")
+                        cleanupDevice(device)
+                    }
+                } catch (e: Exception) {
+                    Log.e("BLE", "Error sending notification to ${device.address}: ${e.message}")
+                    cleanupDevice(device)
+                }
             }
         }
     }
@@ -152,13 +176,30 @@ class MainActivity : FlutterActivity() {
         bluetoothGattServer?.close()
         advertiser = null
         bluetoothGattServer = null
+        
+        // Clear all device tracking
         connectedDevices.clear()
         notificationEnabledDevices.clear()
+        deviceAddresses.clear()
+        notificationAddresses.clear()
+        
         Log.i("BLE", "Peripheral stopped")
     }
 
-    // Track which devices have enabled notifications
-    private val notificationEnabledDevices: MutableSet<BluetoothDevice> = mutableSetOf()
+    // Helper function to clean up a device from all tracking sets
+    private fun cleanupDevice(device: BluetoothDevice) {
+        val address = device.address
+        
+        // Remove from device collections
+        connectedDevices.removeAll { it.address == address }
+        notificationEnabledDevices.removeAll { it.address == address }
+        
+        // Remove from address tracking
+        deviceAddresses.remove(address)
+        notificationAddresses.remove(address)
+        
+        Log.i("BLE", "Cleaned up device: $address")
+    }
 
     private fun sendMessageToClients(message: String) {
         if (connectedDevices.isEmpty()) {
@@ -168,27 +209,35 @@ class MainActivity : FlutterActivity() {
 
         val value = message.toByteArray(Charsets.UTF_8)
 
-        // Only send to devices that have enabled notifications
-        notificationEnabledDevices.forEach { device ->
+        // Group devices by address to avoid sending to same device multiple times
+        val uniqueDevices = notificationEnabledDevices.groupBy { it.address }.mapValues { it.value.first() }
+        
+        Log.i("BLE", "Sending message to ${uniqueDevices.size} unique devices (from ${notificationEnabledDevices.size} total entries)")
+
+        uniqueDevices.values.forEach { device ->
             characteristic?.let { char ->
                 try {
-                    val success =
-                            bluetoothGattServer?.notifyCharacteristicChanged(
-                                    device,
-                                    char,
-                                    false,
-                                    value
-                            )
-                    Log.i("BLE", "Notification sent to ${device.address}: $success")
-                    if (success != BluetoothGatt.GATT_SUCCESS) {
-                        Log.w(
-                                "BLE",
-                                "Notification failed for ${device.address} - removing from notification list"
+                    // Double-check device is still connected
+                    if (deviceAddresses.contains(device.address)) {
+                        val success = bluetoothGattServer?.notifyCharacteristicChanged(
+                                device,
+                                char,
+                                false,
+                                value
                         )
-                        notificationEnabledDevices.remove(device)
+                        Log.i("BLE", "Notification sent to ${device.address}: $success")
+                        
+                        if (success != BluetoothGatt.GATT_SUCCESS) {
+                            Log.w("BLE", "Notification failed for ${device.address} - removing from lists")
+                            cleanupDevice(device)
+                        }
+                    } else {
+                        Log.w("BLE", "Device ${device.address} no longer connected - removing from notification list")
+                        cleanupDevice(device)
                     }
                 } catch (e: Exception) {
-                    Log.e("BLE", "Error sending notification: ${e.message}")
+                    Log.e("BLE", "Error sending notification to ${device.address}: ${e.message}")
+                    cleanupDevice(device)
                 }
             }
         }
@@ -212,16 +261,35 @@ class MainActivity : FlutterActivity() {
                     when (newState) {
                         BluetoothProfile.STATE_CONNECTED -> {
                             Log.i("BLE", "Device connected: ${device.address}, status: $status")
-                            connectedDevices.add(device)
-                            sendFlutterEvent(
-                                    "onDeviceConnected",
-                                    mapOf("address" to device.address)
-                            )
+                            
+                            val address = device.address
+                            
+                            // Clean up any existing references to this device first
+                            cleanupDevice(device)
+                            
+                            // Add to connected devices only if not already present
+                            if (!deviceAddresses.contains(address)) {
+                                connectedDevices.add(device)
+                                deviceAddresses.add(address)
+                                
+                                Log.i("BLE", "Added new device: $address. Total connected devices: ${deviceAddresses.size}")
+                                
+                                sendFlutterEvent(
+                                        "onDeviceConnected",
+                                        mapOf("address" to address)
+                                )
+                            } else {
+                                Log.w("BLE", "Device $address already in connected list")
+                            }
                         }
                         BluetoothProfile.STATE_DISCONNECTED -> {
                             Log.i("BLE", "Device disconnected: ${device.address}, status: $status")
-                            connectedDevices.remove(device)
-                            notificationEnabledDevices.remove(device)
+                            
+                            // Clean up all references to this device
+                            cleanupDevice(device)
+                            
+                            Log.i("BLE", "Total connected devices: ${deviceAddresses.size}")
+                            
                             sendFlutterEvent(
                                     "onDeviceDisconnected",
                                     mapOf("address" to device.address)
@@ -276,10 +344,15 @@ class MainActivity : FlutterActivity() {
                     val message = String(value, Charsets.UTF_8)
                     Log.i("BLE", "Received message from ${device.address}: $message")
 
-                    sendFlutterEvent(
-                            "onMessageReceived",
-                            mapOf("message" to message, "address" to device.address)
-                    )
+                    // Verify device is still in our connected list
+                    if (deviceAddresses.contains(device.address)) {
+                        sendFlutterEvent(
+                                "onMessageReceived",
+                                mapOf("message" to message, "address" to device.address)
+                        )
+                    } else {
+                        Log.w("BLE", "Received message from device not in connected list: ${device.address}")
+                    }
 
                     if (responseNeeded) {
                         bluetoothGattServer?.sendResponse(
@@ -314,28 +387,47 @@ class MainActivity : FlutterActivity() {
                     Log.i("BLE", "Descriptor write request from: ${device.address}")
 
                     // Check if this is the CCCD descriptor
-                    if (descriptor.uuid == UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                    ) {
+                    if (descriptor.uuid == UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")) {
                         when {
-                            value.contentEquals(
-                                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            ) -> {
-                                Log.i("BLE", "Notifications enabled for ${device.address}")
-                                notificationEnabledDevices.add(device)
-                                sendFlutterEvent(
-                                        "onNotificationsEnabled",
-                                        mapOf("address" to device.address)
-                                )
+                            value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) -> {
+                                val address = device.address
+                                Log.i("BLE", "Notifications enabled for $address")
+                                
+                                // Ensure device is in connected list before adding to notification list
+                                if (deviceAddresses.contains(address)) {
+                                    // Only add if not already present
+                                    if (!notificationAddresses.contains(address)) {
+                                        notificationEnabledDevices.add(device)
+                                        notificationAddresses.add(address)
+                                        
+                                        Log.i("BLE", "Added device to notification list: $address. Total devices with notifications: ${notificationAddresses.size}")
+                                        
+                                        sendFlutterEvent(
+                                                "onNotificationsEnabled",
+                                                mapOf("address" to address)
+                                        )
+                                    } else {
+                                        Log.w("BLE", "Device $address already has notifications enabled")
+                                    }
+                                } else {
+                                    Log.w("BLE", "Device $address not in connected list, ignoring notification enable")
+                                }
                             }
-                            value.contentEquals(
-                                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                            ) -> {
-                                Log.i("BLE", "Notifications disabled for ${device.address}")
-                                notificationEnabledDevices.remove(device)
-                                sendFlutterEvent(
-                                        "onNotificationsDisabled",
-                                        mapOf("address" to device.address)
-                                )
+                            value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) -> {
+                                val address = device.address
+                                Log.i("BLE", "Notifications disabled for $address")
+                                
+                                if (notificationAddresses.contains(address)) {
+                                    notificationEnabledDevices.removeAll { it.address == address }
+                                    notificationAddresses.remove(address)
+                                    
+                                    Log.i("BLE", "Removed device from notification list: $address. Total devices with notifications: ${notificationAddresses.size}")
+                                    
+                                    sendFlutterEvent(
+                                            "onNotificationsDisabled",
+                                            mapOf("address" to address)
+                                    )
+                                }
                             }
                             else -> {
                                 Log.w("BLE", "Unknown descriptor value: ${value.contentToString()}")
